@@ -1,3 +1,5 @@
 processed-data
 misc
 iXnos
+__pycache__
+*.pyc

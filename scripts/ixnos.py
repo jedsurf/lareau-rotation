@@ -10,15 +10,30 @@ import pandas as pd
 from scipy.stats import pearsonr
 from torch.utils.data import DataLoader, TensorDataset
 import glob
+import random
 
 # GENERAL SCRIPT to run iXnos on ribo-seq data
 # Sample linear leaveout series command:
     # for i in {-5..4}; do python ixnos.py -d ../processed-data/thp1 -o ../processed-data/thp1/models -g ../iXnos/genome_data/human.transcripts.13cds10.transcripts.fa -l $i > ../processed-data/thp1/logs/leaveout_$i.log 2>&1; done
 
 class iXnos(nn.Module):
-    def __init__(self, n_codons = 10, *args, **kwargs):
+    def __init__(self, min_codon = -5, max_codon = 4, leaveout:int=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.n_codons = n_codons
+        # Get general useful properties
+        self.codon_to_id = self.get_codon_to_id()
+        self.nt_to_id = self.get_nt_to_id()
+        self.let2cod = self.get_aa_to_codon()
+        # iXnos-specific stuff
+        self.min_codon = min_codon
+        self.max_codon = max_codon
+        self.codon_indices = list(range(self.min_codon, self.max_codon + 1))
+        self.nt_indices = list(range(3 * self.min_codon, 3 * (self.max_codon + 1)))
+        self.leaveout = leaveout
+        if self.leaveout is not None:
+            self.codon_indices.remove(self.leaveout)
+            for i in range(3 * self.leaveout, 3 * (self.leaveout + 1)):
+                self.nt_indices.remove(i)
+        self.n_codons = len(self.codon_indices)
         self.input_layer_size = 76 * self.n_codons
         self.layers = nn.Sequential(
             nn.Linear(self.input_layer_size, 200),
@@ -31,6 +46,78 @@ class iXnos(nn.Module):
         output = self.layers(x)
         return output 
 
+
+    def predict(self, x):
+        """Predicts scaled codon count at a given codon position"""
+        self.eval()
+        with torch.no_grad():
+            return self(x)
+    
+    def get_inputs(self, codons : list):
+        # Given a list of codons, get an input vector for iXnos
+        nts = "".join(codons)
+        codon_vector = np.concatenate([self.encode(i, self.codon_to_id) for i in codons])
+        nt_vector = np.concatenate([self.encode(i, self.nt_to_id) for i in nts])
+        input_vector = np.concatenate([codon_vector, nt_vector])
+        input_vector = torch.from_numpy(input_vector).to(torch.float32)
+        return input_vector
+    
+    def predict_elongation(self, seq):
+        """Given a sequence and an iXnos model, predict the sum of
+        scaled counts at each codon index.
+
+        Args:
+            seq (str): Amino acid sequence of transcript of interest.
+
+        Returns:
+            int: Sum of scaled counts; proxy for predicted elongation time
+        """    
+        seq = seq.upper()
+        # I train iXnos on DNA sequences, so need to convert U to T
+        if "U" in seq:
+            seq = seq.replace("U", "T")
+        # Add "NNN" codons to beginning and end of sequence in order to pass 
+        # first and last few codons through iXnos
+        seq = "".join(["NNN" for i in range(0 - self.min_codon)]) \
+            + seq + "".join(["NNN" for i in range(self.max_codon)])
+        # Predict scaled counts across all codons
+        codons = [seq[i:i+3] for i in range(0, len(seq), 3)]
+        overall_count = 0
+        for i in range(0 - self.min_codon, len(codons) - self.max_codon):
+            input_vector = self.get_inputs(codons[i + self.min_codon:i + self.max_codon + 1])
+            overall_count += self.predict(input_vector).item()
+        return overall_count
+
+    def predict_random_speeds(self, cds, n_samples, **kwargs):
+        seqs, speeds = [], []
+        for i in range(n_samples):
+            codons = [random.choice(self.let2cod[i]) for i in cds]
+            nt_seq = "".join(codons)
+            pred_speed = self.predict_elongation(nt_seq, **kwargs)
+            seqs.append(nt_seq)
+            speeds.append(pred_speed)
+        return seqs, speeds
+    
+    @classmethod
+    def encode(cls, val: str, ref: dict):
+        """
+        Encodes a nucleotide or codon value as a one-hot vector 
+        based on the provided reference dictionary.
+
+        Args:
+            val (str): The value to be encoded (e.g., nucleotide or codon).
+            ref (dict): A dictionary mapping values to indices.
+
+        Returns:
+            np.ndarray: A one-hot encoded vector of the input value.
+            Note that if the input value is not in the provided dictionary, 
+            will return a 0 vector.
+        """    
+        output = np.zeros(len(ref))
+        if val in ref:
+            output[ref[val]] = 1
+        return output
+    
     # A bunch of class methods to get variables we can use to encode 
     # nucleotide and codon data for the model
     @classmethod
@@ -59,20 +146,33 @@ class iXnos(nn.Module):
     def get_id_to_nt(cls):
         # ID to Nucleotide mapping
         return {idx: nt for nt, idx in cls.get_nt_to_id().items()}
-   
-# class iXnosLeaveOut(nn.Module):
-#     def __init__(self, *args, **kwargs):
-#         super().__init__(*args, **kwargs)
-#         self.layers = nn.Sequential(
-#             nn.Linear(684, 200),
-#             nn.Tanh(),
-#             nn.Linear(200, 1),
-#             nn.ReLU(),
-#         )
-    
-#     def forward(self, x):
-#         output = self.layers(x)
-#         return output 
+
+    @classmethod
+    def get_aa_to_codon(cls):
+        let2cod = {
+            'F': ['TTT', 'TTC'],
+            'L': ['TTA', 'TTG', 'CTT', 'CTC', 'CTA', 'CTG'],
+            'I': ['ATT', 'ATC', 'ATA'],
+            'M': ['ATG'],
+            'V': ['GTT', 'GTC', 'GTA', 'GTG'],
+            'S': ['TCT', 'TCC', 'TCA', 'TCG', 'AGT', 'AGC'],
+            'P': ['CCT', 'CCC', 'CCA', 'CCG'],
+            'T': ['ACT', 'ACC', 'ACA', 'ACG'],
+            'A': ['GCT', 'GCC', 'GCA', 'GCG'],
+            'Y': ['TAT', 'TAC'],
+            'H': ['CAT', 'CAC'],
+            'Q': ['CAA', 'CAG'],
+            'N': ['AAT', 'AAC'],
+            'K': ['AAA', 'AAG'],
+            'D': ['GAT', 'GAC'],
+            'E': ['GAA', 'GAG'],
+            'C': ['TGT', 'TGC'],
+            'W': ['TGG'],
+            'R': ['CGT', 'CGC', 'CGA', 'CGG', 'AGA', 'AGG'],
+            'G': ['GGT', 'GGC', 'GGA', 'GGG'],
+        }
+        return let2cod
+
 
 def load_gdf(ydf, gdf_path):
     # Loads the dataframe with gene sequences and finds the (truncated) 
@@ -89,26 +189,26 @@ def load_gdf(ydf, gdf_path):
     gdf["start"] = gdf.apply(lambda row: row['seq'].find(row['cod_gene']), axis=1)
     return gdf
 
-def encode(val: str, ref: dict):
-    """
-    Encodes a nucleotide or codon value as a one-hot vector 
-    based on the provided reference dictionary.
+# def encode(val: str, ref: dict):
+#     """
+#     Encodes a nucleotide or codon value as a one-hot vector 
+#     based on the provided reference dictionary.
 
-    Args:
-        val (str): The value to be encoded (e.g., nucleotide or codon).
-        ref (dict): A dictionary mapping values to indices.
+#     Args:
+#         val (str): The value to be encoded (e.g., nucleotide or codon).
+#         ref (dict): A dictionary mapping values to indices.
 
-    Returns:
-        np.ndarray: A one-hot encoded vector of the input value.
-        Note that if the input value is not in the provided dictionary, 
-        will return a 0 vector.
-    """    
-    output = np.zeros(len(ref))
-    if val in ref:
-        output[ref[val]] = 1
-    return output
+#     Returns:
+#         np.ndarray: A one-hot encoded vector of the input value.
+#         Note that if the input value is not in the provided dictionary, 
+#         will return a 0 vector.
+#     """    
+#     output = np.zeros(len(ref))
+#     if val in ref:
+#         output[ref[val]] = 1
+#     return output
 
-def get_inputs(row, leaveout=None):
+def get_inputs_from_gdf(row, leaveout=None):
     # Get input vectors for a given row of the y dataframe.
     # leaveout: index of codon to leave out in model
     gdf_gene = gdf.loc[row["gene"]]
@@ -127,8 +227,8 @@ def get_inputs(row, leaveout=None):
         # NOTE: assumes your nt footprint is an in frame CDS containing just the codons we wanna look at
     footprint_codons = [footprint_nt[i:i+3] for i in range(0, len(footprint_nt), 3)]
     # Assemble input tensor
-    codon_vector = np.concatenate([encode(i, COD2ID) for i in footprint_codons])
-    nt_vector = np.concatenate([encode(i, NT2ID) for i in footprint_nt])
+    codon_vector = np.concatenate([iXnos.encode(i, COD2ID) for i in footprint_codons])
+    nt_vector = np.concatenate([iXnos.encode(i, NT2ID) for i in footprint_nt])
     input_vector = np.concatenate([codon_vector, nt_vector])
     input_vector = torch.from_numpy(input_vector).to(torch.float32)
     return input_vector
@@ -215,17 +315,11 @@ if __name__ == "__main__":
     pos_3 = args.pos_3
     print(f"Training an iXnos model\n\tCodon range: {pos_5} to {pos_3}\n\tLeaveout index: {leaveout}")
     # Variables for encoding inputs
-    # ALPHA = "ACGT"  # Defines the possible nucleotides
-    # NTS = ["A", "C", "G", "T"]  # Nucleotide list
     CODONS = iXnos.get_codons()  # List of all possible codons
     COD2ID = iXnos.get_codon_to_id()  # Codon to ID mapping
     ID2COD = iXnos.get_id_to_codon()  # ID to Codon mapping
     NT2ID = iXnos.get_nt_to_id()  # Nucleotide to ID mapping
     ID2NT = iXnos.get_id_to_nt()  # ID to Nucleotide mapping  
-    # Define the indices of the codons and nucleotides iXnos will use  
-    CODON_INDICES = np.arange(pos_5, pos_3 + 1)  # Codon indices window
-    NT_INDICES = np.arange(3*pos_5, 3*(pos_3 + 1))  # Nucleotide indices window
-    N_CODONS = len(CODON_INDICES)
     # Initialize model
     device = (
         "cuda"
@@ -236,18 +330,18 @@ if __name__ == "__main__":
     )
     print(f"Using {device} device")
     # Initialize model
-    if leaveout is None:
-        model = iXnos(n_codons=N_CODONS).to(device)
-    else:
-        model = iXnos(n_codons=N_CODONS - 1).to(device)
+    model = iXnos(min_codon = pos_5, max_codon = pos_3, leaveout=leaveout).to(device)
+    CODON_INDICES = model.codon_indices  # Codon indices window
+    # NOTE: I'm NOT using the iXnos nt_indices property here just to be compatible with the get_inputs_from_gdf function
+    NT_INDICES = np.arange(3*pos_5, 3*(pos_3 + 1))  # Nucleotide indices window
     # Read the pre-calculated train and test datasets as pandas dataframes
     # Detect train and test datasets
-    train_naming_scheme = f"{data_dir}/process/tr_set_bounds*data_table.txt"
+    train_naming_scheme = f"{data_dir}/tr_set_bounds*data_table.txt"
     files_tr = glob.glob(train_naming_scheme)
     filepath_train = files_tr[0]
     print(f"Training set: found {files_tr}, using {filepath_train}")
     
-    test_naming_scheme = f"{data_dir}/process/te_set_bounds*data_table.txt"
+    test_naming_scheme = f"{data_dir}/te_set_bounds*data_table.txt"
     files_te = glob.glob(test_naming_scheme)
     filepath_test = files_te[0]
     print(f"Test set: found {files_te}, using {filepath_test}")
@@ -264,7 +358,7 @@ if __name__ == "__main__":
     # Combine these dataframes and encode each codon
     ydf = pd.concat([ydf_te, ydf_tr]).sort_values(by=["gene", "cod_idx"])
     gdf = load_gdf(ydf, gdf_path)
-    ydf["X"] = ydf.apply(get_inputs, axis=1, leaveout=leaveout)
+    ydf["X"] = ydf.apply(get_inputs_from_gdf, axis=1, leaveout=leaveout)
     # Extract inputs and outputs for model
     X_tr, y_tr = ydf.loc[ydf["gene"].isin(genes_tr), ["X", "scaled_cts"]].values.T.tolist()
     X_te, y_te = ydf.loc[ydf["gene"].isin(genes_te), ["X", "scaled_cts"]].values.T.tolist()

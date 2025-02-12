@@ -62,12 +62,14 @@ class iXnos(nn.Module):
         input_vector = torch.from_numpy(input_vector).to(torch.float32)
         return input_vector
     
-    def predict_elongation(self, seq):
+    def predict_elongation(self, seq, profile=False):
         """Given a sequence and an iXnos model, predict the sum of
         scaled counts at each codon index.
 
         Args:
             seq (str): Amino acid sequence of transcript of interest.
+            profile (bool): If true, returns a list of the scaled counts at each position. 
+                            Defaults to False. 
 
         Returns:
             int: Sum of scaled counts; proxy for predicted elongation time
@@ -82,11 +84,18 @@ class iXnos(nn.Module):
             + seq + "".join(["NNN" for i in range(self.max_codon)])
         # Predict scaled counts across all codons
         codons = [seq[i:i+3] for i in range(0, len(seq), 3)]
-        overall_count = 0
-        for i in range(0 - self.min_codon, len(codons) - self.max_codon):
-            input_vector = self.get_inputs(codons[i + self.min_codon:i + self.max_codon + 1])
-            overall_count += self.predict(input_vector).item()
-        return overall_count
+        if profile:
+            counts = []
+            for i in range(0 - self.min_codon, len(codons) - self.max_codon):
+                input_vector = self.get_inputs(codons[i + self.min_codon:i + self.max_codon + 1])
+                counts.append(self.predict(input_vector).item())
+            return counts
+        else:
+            overall_count = 0
+            for i in range(0 - self.min_codon, len(codons) - self.max_codon):
+                input_vector = self.get_inputs(codons[i + self.min_codon:i + self.max_codon + 1])
+                overall_count += self.predict(input_vector).item()
+            return overall_count
 
     def predict_random_speeds(self, cds, n_samples, **kwargs):
         seqs, speeds = [], []

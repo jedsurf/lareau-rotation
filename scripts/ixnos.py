@@ -11,6 +11,7 @@ from scipy.stats import pearsonr
 from torch.utils.data import DataLoader, TensorDataset
 import glob
 import random
+import itertools
 
 # GENERAL SCRIPT to run iXnos on ribo-seq data
 # Sample linear leaveout series command:
@@ -107,6 +108,96 @@ class iXnos(nn.Module):
             speeds.append(pred_speed)
         return seqs, speeds
     
+    def optimize_codons(self, seq: str, fastest = True, stop_codon = True, sanity_check = False):
+        """Computes the coding sequence for a given amino acid sequence that minimizes or maximizes 
+        overall counts predicted by this model.
+
+        Args:
+            seq (str): String amino acid sequence to optimize. 
+            fastest (bool, optional): Specify true to find the CDS that minimizes overall counts 
+                or False to find the CDS that maximizes overall counts. Defaults to True.
+            stop_codon (bool, optional): Whether or not to include a stop codon at the end of the 
+                optimized sequence. Defaults to True. 
+
+        Returns:
+            str: Optimal coding sequence as a string
+        """        
+        let2cod = iXnos.get_aa_to_codon()
+        seq = seq.upper()
+        #TODO: ADD * TO END
+        if stop_codon:
+            if seq[-1] != "*":
+                seq = seq + "*"
+        def zeta(aa_seq):
+            # Generate a list of all possible codon combinations for a given AA sequence
+            possible_codons = [let2cod[i] for i in aa_seq]
+            if len(aa_seq) < self.max_codon + 1 - self.min_codon:
+                possible_codons = [["NNN"] for _ in range(self.max_codon + 1 - self.min_codon - len(aa_seq))] + possible_codons
+            return list(itertools.product(*possible_codons))
+        
+        
+        L = len(seq)
+        # Q[i] contains possible codon combinations within the iXnos window at position i
+        # T[i] contains the iXnos predictions for each combination in Q[i]
+        Q, T = [], [] 
+        c_min = np.zeros(L, dtype=int)
+        c_max = np.zeros(L, dtype=int)
+        # Iterate through the given AA sequence, get combos of possible codon combinations at 
+        # each pertinent iXnos window, and calculate + store iXnos prediction for each codon set
+        for i in range(L):
+            c_min[i] = max(0, i + self.min_codon - self.max_codon)
+            c_max[i] = i + 1
+            Q.append(zeta(seq[c_min[i]: c_max[i]]))
+            # Calculate expected ribo counts
+            T.append([])
+            for q in Q[i]:
+                prediction_q = self.predict(self.get_inputs(q)).item()
+                T[i].append(prediction_q)
+        # Calculate optimal preceding sequence sets for each sequence set
+        # P[i] stores the index of the shortest path so far running through each possible sequence combo in Q
+        # V[i] stores the running sum of iXnos-predicted counts at each position i
+        P, V = [], []
+        for i in range(L):
+            P.append([])
+            V.append([])
+            if i == 0:
+                for q_i, q in enumerate(Q[i]):
+                    P[i].append(np.nan)
+                    V[i].append(T[i][q_i])
+            else:
+                for q_i, q in enumerate(Q[i]):
+                    # Get indices of previous aa that match the possible codon sequences preceding this aa
+                    previous_indices = np.where([q_prev[1:] == q[:-1] for q_prev in Q[i - 1]])[0]
+                    # Find either the fastest or slowest possible path that ends in this particular codon combo
+                    # TODO: Potentially alter this to consider multiple possible paths
+                    if fastest:
+                        P_i_q = int(previous_indices[np.argmin([V[i - 1][j] for j in previous_indices])])
+                    else:
+                        P_i_q = int(previous_indices[np.argmax([V[i - 1][j] for j in previous_indices])])
+                    P[i].append(P_i_q)
+                    V[i].append(V[i-1][P_i_q] + T[i][q_i])
+        # Backtrack through these arrays, starting at the lowest possible final V and using the 
+        # corresponding P for that, and construct the optimal CDS from that
+        # NOTE: I've noticed that for small sequences, the min V[-1] is not the same as the 
+        # final predicted summed overall counts for the cds output... 
+        q_L = np.argmin(V[-1]) if fastest else np.argmax(V[-1])
+        p_i = P[-1][q_L]
+        cds = "".join(Q[-1][q_L])
+        for i in range(-(L - (self.max_codon - self.min_codon)), -1)[::-1]:
+            q_i = Q[i][p_i]
+            p_i = P[i][p_i]
+            cds = q_i[0] + cds
+        # i = 0
+        # for _ in range(L - 1 - (self.max_codon - self.min_codon)):
+        #     i -= 1
+        #     print(i)
+        #     p_i = P[i][p_i]
+        #     q_i = Q[i - 1][p_i]
+        #     cds = q_i[0] + cds
+        if sanity_check:
+            return cds, min(V[-1])
+        return cds
+    
     @classmethod
     def encode(cls, val: str, ref: dict):
         """
@@ -179,6 +270,7 @@ class iXnos(nn.Module):
             'W': ['TGG'],
             'R': ['CGT', 'CGC', 'CGA', 'CGG', 'AGA', 'AGG'],
             'G': ['GGT', 'GGC', 'GGA', 'GGG'],
+            '*': ['TAG', 'TGA', 'TAA'],
         }
         return let2cod
 

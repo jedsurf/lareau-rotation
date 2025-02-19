@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader, TensorDataset
 import glob
 import random
 import itertools
+import pickle
 
 # GENERAL SCRIPT to run iXnos on ribo-seq data
 # Sample linear leaveout series command:
@@ -274,7 +275,108 @@ class iXnos(nn.Module):
         }
         return let2cod
 
+# USEFUL FUNCTIONS; NOT NEEDED IN THIS SCRIPT
+def load_ixnos(pklpath, **kwargs):
+    """Loads a .pkl iXnos model into the pytorch implementation.
+    Use this if you need to load a model trained using the original paper's scripts.
 
+    Args:
+        pklpath (str): path to pkl file with model weights and biases.
+
+    Returns:
+        iXnos model
+    """    
+    model = iXnos(**kwargs)#.to(device)
+
+    with open(pklpath, 'rb') as file:
+        # Load the pickled data
+        data = pickle.load(file, encoding='bytes')
+    for idx, val in enumerate(data):
+        data[idx] = torch.from_numpy(val).T
+    layer_name = "layers"
+    labels = [
+        f"{layer_name}.0.weight", f"{layer_name}.0.bias", 
+        f"{layer_name}.2.weight", f"{layer_name}.2.bias"]
+
+    old_model = OrderedDict(zip(labels, data))
+
+    model.load_state_dict(old_model)
+    return model
+
+def legend_kwargs():
+    # Commonly used kwargs for figure legends
+    kwargs = {
+        "frameon" : False, 
+        "bbox_to_anchor" : (1, 0.5), 
+        "loc" : "center left"}
+    return kwargs
+
+def generate_leaveout_plots(model_dir, min_codon, max_codon, return_comps=False):
+    """Generates loss by epoch and correlation by epoch plots, as well as 
+    barplots showing the overall difference in pearson correlation between each
+    leaveout model and the full model.  
+
+    Args:
+        model_dir (str): Directory with full + leaveout models saved. 
+        min_codon (int): Minimum codon used in iXnos model. 
+        max_codon (int): Maximum codon used in iXnos model. 
+        return_comps (bool): Optional argument to return a dictionary of 
+        the changes in pearson correlation between each leaveout model 
+        and the full model. Defaults to False.
+
+    Returns:
+        comps (optionally): a dictionary of the changes in pearson 
+        correlation between each leaveout model and the full model.
+        Useful in case you want to tweak the final bar plot. 
+    """    
+    full_df = pd.read_csv(f"{model_dir}/ixnos_n{np.abs(min_codon)}p{max_codon}_full_loss_by_epoch.csv", index_col=0)
+    r_full = full_df.iloc[-1]["corr_te"].item()
+
+    named_sites = {
+        0: "A",
+        -1: "P",
+        -2: "E"
+    }
+
+    fig0, ax0 = plt.subplots()
+    ax0.set_title("Training Loss")
+    ax0.set_xlabel("Training Loss")
+    fig1, ax1 = plt.subplots()
+    ax1.set_title("Test Loss")
+    ax1.set_xlabel("Test Loss")
+    fig2, ax2 = plt.subplots()
+    ax2.set_title("Pearson Correlation vs. Epoch")
+    ax2.set_xlabel("Pearson Correlation")
+
+    sns.lineplot(full_df, x = range(len(full_df)), y="loss_tr", ax=ax0, label="Full Model")
+    sns.lineplot(full_df, x = range(len(full_df)), y="loss_te", ax=ax1, label="Full Model")
+    sns.lineplot(full_df, x = range(len(full_df)), y="corr_te", ax=ax2, label="Full Model")
+
+    comps = {}
+    for l in range(min_codon, max_codon+1):
+        res = pd.read_csv(f"{model_dir}/ixnos_n{np.abs(min_codon)}p{max_codon}_leaveout_{l}_loss_by_epoch.csv", index_col=0)
+        if l in named_sites.keys():
+            l = named_sites[l]
+        sns.lineplot(res, x = range(len(res)), y="loss_tr", ax=ax0, label=f"Leave out {l}")
+        sns.lineplot(res, x = range(len(res)), y="loss_te", ax=ax1, label=f"Leave out {l}")
+        sns.lineplot(res, x = range(len(res)), y="corr_te", ax=ax2, label=f"Leave out {l}")
+        r_leaveout = res.iloc[-1]["corr_te"].item()
+        delta_r = r_full - r_leaveout
+        comps[l] = delta_r
+
+    for ax in [ax0, ax1, ax2]:
+        ax.legend(title="Model", **legend_kwargs())
+        ax.set_xlabel("Epoch")
+    plt.show()
+
+    sns.barplot(comps)
+    plt.ylabel("\u0394 Correlation")
+    plt.xlabel("Codon Site")
+    plt.show()
+    if return_comps:
+        return comps
+
+# FUNCTIONS NECESSARY ONLY FOR THIS SCRIPT
 def load_gdf(ydf, gdf_path):
     # Loads the dataframe with gene sequences and finds the (truncated) 
     # CDS we want to feed to iXnos within that sequence
@@ -290,24 +392,6 @@ def load_gdf(ydf, gdf_path):
     gdf["start"] = gdf.apply(lambda row: row['seq'].find(row['cod_gene']), axis=1)
     return gdf
 
-# def encode(val: str, ref: dict):
-#     """
-#     Encodes a nucleotide or codon value as a one-hot vector 
-#     based on the provided reference dictionary.
-
-#     Args:
-#         val (str): The value to be encoded (e.g., nucleotide or codon).
-#         ref (dict): A dictionary mapping values to indices.
-
-#     Returns:
-#         np.ndarray: A one-hot encoded vector of the input value.
-#         Note that if the input value is not in the provided dictionary, 
-#         will return a 0 vector.
-#     """    
-#     output = np.zeros(len(ref))
-#     if val in ref:
-#         output[ref[val]] = 1
-#     return output
 
 def get_inputs_from_gdf(row, leaveout=None):
     # Get input vectors for a given row of the y dataframe.
@@ -437,12 +521,12 @@ if __name__ == "__main__":
     NT_INDICES = np.arange(3*pos_5, 3*(pos_3 + 1))  # Nucleotide indices window
     # Read the pre-calculated train and test datasets as pandas dataframes
     # Detect train and test datasets
-    train_naming_scheme = f"{data_dir}/tr_set_bounds*data_table.txt"
+    train_naming_scheme = f"{data_dir}/tr_*data_table.txt"
     files_tr = glob.glob(train_naming_scheme)
     filepath_train = files_tr[0]
     print(f"Training set: found {files_tr}, using {filepath_train}")
     
-    test_naming_scheme = f"{data_dir}/te_set_bounds*data_table.txt"
+    test_naming_scheme = f"{data_dir}/te_*data_table.txt"
     files_te = glob.glob(test_naming_scheme)
     filepath_test = files_te[0]
     print(f"Test set: found {files_te}, using {filepath_test}")

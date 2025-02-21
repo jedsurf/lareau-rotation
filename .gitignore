@@ -1,5 +1,15 @@
 processed-data
 misc
-iXnos
+# iXnos
 __pycache__
 *.pyc
+clean_vestigium
+*.fastq
+*.bam
+*.sam
+*.bowtiestats
+*.results
+*.log
+processed-data/thp1
+Rplots.pdf
+get-pip.py

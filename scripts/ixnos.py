@@ -188,17 +188,38 @@ class iXnos(nn.Module):
             q_i = Q[i][p_i]
             p_i = P[i][p_i]
             cds = q_i[0] + cds
-        # i = 0
-        # for _ in range(L - 1 - (self.max_codon - self.min_codon)):
-        #     i -= 1
-        #     print(i)
-        #     p_i = P[i][p_i]
-        #     q_i = Q[i - 1][p_i]
-        #     cds = q_i[0] + cds
         if sanity_check:
-            return cds, min(V[-1])
+            return cds, min(V[-1]) if fastest else max(V[-1])
         return cds
     
+    def mutate_seq(self, seq, n_mut, n_iter):
+        """Given a sequence, return n_iter sequences that code for the same protein
+        but differ at <= n_mut codons. Usually, you'll want to use this on optimized 
+        sequences to generate slightly sub-optimal sequences. Each iteration mutates
+        the mutated sequence from the previous iteration.
+
+        Args:
+            seq (str): CDS you want to mutate.
+            n_mut (int): How many synonymous codon alterations to make per iteration
+            n_iter (int): How many times to repeat mutating the sequence.
+
+        Returns:
+            list: A list of mutated sequences.
+        """        
+        sequences = [seq]
+        cod2aa = self.get_codon_to_aa()
+        let2cod = self.get_aa_to_codon()
+
+        for _ in range(n_iter):
+            seq_current = sequences[-1]
+            codons = [seq_current[i:i+3] for i in range(0, len(seq_current), 3)]
+            mut_indices = np.random.choice(range(len(codons)), n_mut)
+            for i in mut_indices:
+                codons[i] = np.random.choice(let2cod[cod2aa[codons[i]]])
+            newseq = "".join(codons)
+            sequences.append(newseq)
+        return sequences[1:]
+
     @classmethod
     def encode(cls, val: str, ref: dict):
         """
@@ -274,6 +295,13 @@ class iXnos(nn.Module):
             '*': ['TAG', 'TGA', 'TAA'],
         }
         return let2cod
+
+    @classmethod
+    def get_codon_to_aa(cls):
+        """Returns a dictionary of {codon : amino acid}
+        """        
+        let2cod = cls.get_aa_to_codon()
+        return {codon:letter for letter in let2cod for codon in let2cod[letter]}
 
 # USEFUL FUNCTIONS; NOT NEEDED IN THIS SCRIPT
 def load_ixnos(pklpath, **kwargs):
